@@ -3,6 +3,8 @@
 Everything the `zfs-install` branch adds, packaged so it can be replayed onto a
 clean upstream clone.
 
+![Omarchy with ZFS](./screens/01-zfs.png)
+
 ## Contents
 
 - `apply-zfs.sh` — self-contained script; the patch is embedded, so this single
