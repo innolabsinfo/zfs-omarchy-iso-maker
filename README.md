@@ -112,3 +112,6 @@ on a fresh machine is longer (it downloads the Arch packages and compiles
 When the build finishes, the ISO is in **`./omarchy-iso/release/`**, named
 **`zfs-omarchy-<version>-x86_64-<ref>.iso`** — for example
 `zfs-omarchy-2026.09.19-x86_64-quattro.iso`.
+
+![Omarchy with ZFS](./screens/11-zfs.png)
+
