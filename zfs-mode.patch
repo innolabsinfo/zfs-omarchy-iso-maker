@@ -1,0 +1,1148 @@
+diff --git a/builder/build-iso.sh b/builder/build-iso.sh
+index aa2feb3..9e2526e 100755
+--- a/builder/build-iso.sh
++++ b/builder/build-iso.sh
+@@ -48,6 +48,48 @@ if ! grep -q '^\[omarchy\]' /etc/pacman.conf; then
+   awk '/^\[omarchy\]/,/^$/' /configs/pacman-online-${OMARCHY_MIRROR}.conf >> /etc/pacman.conf
+ fi
+ 
++# ── ZFS ──────────────────────────────────────────────────────────────
++# ZFS is not in any configured repo (AUR only). Build the whole stack into a
++# local repo so it can go into BOTH the live environment (kernel linux-t2) and
++# the offline mirror (target kernel linux-omarchy).
++zfs_repo_dir=/var/cache/omarchy/mirror/aur
++mkdir -p "$zfs_repo_dir"
++id -u zfsbuilder >/dev/null 2>&1 || useradd -m -G wheel zfsbuilder
++chown zfsbuilder:zfsbuilder "$zfs_repo_dir"
++echo 'zfsbuilder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/zfsbuilder
++openzfs_key=4F3BA9AB6D1F8D683DC2DFB56AD860EED4598027
++sudo -u zfsbuilder bash -euo pipefail -c "
++  curl -fsSL 'https://keyserver.ubuntu.com/pks/lookup?op=get&search=0x${openzfs_key}' | gpg --import
++  cd /tmp
++  for p in perl-boolean zfs-utils zfs-dkms zfsbootmenu; do
++    rm -rf \"\$p\"
++    git clone -q https://aur.archlinux.org/\"\$p\".git
++    if [ \"\$p\" = zfsbootmenu ]; then
++      # Skryptowy pakiet bez kompilacji - pomijamy instalowanie zaleznosci
++      # czasu budowy (zfs/perl-boolean sa potrzebne dopiero w systemie docelowym).
++      ( cd \"\$p\" && makepkg -d --noconfirm )
++    else
++      ( cd \"\$p\" && makepkg -s --noconfirm )
++    fi
++    cp \"\$p\"/*.pkg.tar.zst '$zfs_repo_dir'/
++  done
++  gpgconf --kill gpg-agent 2>/dev/null || true
++"
++repo-add "$zfs_repo_dir/aur.db.tar.gz" "$zfs_repo_dir/"*.pkg.tar.zst >/dev/null
++cat >> /etc/pacman.conf <<EOF
++
++[aur]
++SigLevel = Optional TrustAll
++Server = file://$zfs_repo_dir
++EOF
++pacman -Sy --noconfirm >/dev/null 2>&1 || true
++# The AUR packages are rebuilt every run with new checksums. A stale copy in the
++# shared pacman cache (mounted from the host at /var/cache/pacman/pkg) makes
++# mkarchiso reject the fresh ones as "corrupted (checksum)". Drop them so the
++# local [aur] repo wins.
++rm -f /var/cache/pacman/pkg/zfs-utils-* /var/cache/pacman/pkg/zfs-dkms-* \
++      /var/cache/pacman/pkg/zfsbootmenu-* /var/cache/pacman/pkg/perl-boolean-*
++
+ # Build locations
+ build_cache_dir=/var/cache
+ offline_mirror_dir="$build_cache_dir/airootfs/var/cache/omarchy/mirror/offline"
+@@ -64,6 +106,22 @@ rm -rf "$build_cache_dir/airootfs/etc/xdg/reflector"
+ 
+ # Bring in our archiso profile additions.
+ cp -r /configs/* "$build_cache_dir/"
++
++# cloud-init ships with releng. Disabling its datasources (see
++# configs/airootfs/etc/cloud/cloud.cfg.d/99-omarchy-disable.cfg) is not enough:
++# the services stay enabled, so cloud-init still runs its modules (SSH host-key
++# generation, etc.) and logs to the kernel console. That console is the active
++# VT, so the output paints over the installer's TUI on tty1 during boot. Omarchy
++# has its own cidata loader (omarchy-cidata-load), so mask cloud-init so it never
++# runs: a mask symlink covers units pulled in from anywhere, and dropping the
++# target's .wants stops it being reached at all.
++for unit in cloud-init cloud-init-main cloud-init-local cloud-init-network \
++            cloud-config cloud-final cloud-init-hotplugd; do
++  ln -sf /dev/null "$build_cache_dir/airootfs/etc/systemd/system/$unit.service"
++done
++ln -sf /dev/null "$build_cache_dir/airootfs/etc/systemd/system/cloud-init-hotplugd.socket"
++ln -sf /dev/null "$build_cache_dir/airootfs/etc/systemd/system/cloud-init.target"
++rm -rf "$build_cache_dir/airootfs/etc/systemd/system/cloud-init.target.wants"
+ mkdir -p "$build_cache_dir/airootfs/usr/share/omarchy-iso"
+ echo "$OMARCHY_MIRROR" > "$build_cache_dir/airootfs/root/omarchy_mirror"
+ echo "$OMARCHY_ISO_REF" > "$build_cache_dir/airootfs/root/omarchy_iso_ref"
+@@ -118,7 +176,11 @@ cp "/tmp/$NODE_FILENAME" "$build_cache_dir/airootfs/opt/packages/"
+ # The selected omarchy-settings package is needed here so its post_install hook
+ # drops Omarchy's plymouthd.conf into /etc/plymouth before mkarchiso builds the
+ # live initramfs.
+-arch_packages=(linux-t2 git gum jq openssl plymouth ttfx tzupdate omarchy-keyring "$OMARCHY_SETTINGS_PACKAGE" lvm2 cryptsetup parted)
++#
++# ZFS: zfs-utils (userspace) + zfs-dkms built against linux-t2-headers gives the
++# live installer a working ZFS to create the target pool. Headers first so the
++# dkms post-install finds its kernel.
++arch_packages=(linux-t2 linux-t2-headers zfs-utils zfs-dkms git gum jq openssl plymouth ttfx tzupdate omarchy-keyring "$OMARCHY_SETTINGS_PACKAGE" lvm2 cryptsetup parted)
+ printf '%s\n' "${arch_packages[@]}" >> "$build_cache_dir/packages.x86_64"
+ 
+ # The live ISO boots linux-t2 (see airootfs/etc/mkinitcpio.d/linux-t2.preset), so
+@@ -207,7 +269,9 @@ mapfile -t all_packages < <(
+ # still list it in omarchy-other.packages, so map it here until every channel
+ # ships a runtime that names broadcom-wl-dkms itself.
+ mapfile -t all_packages < <(
+-  printf '%s\n' "${all_packages[@]}" | sed 's/^broadcom-wl$/broadcom-wl-dkms/' | sort -u
++  printf '%s\n' "${all_packages[@]}" |
++    sed -e 's/^broadcom-wl$/broadcom-wl-dkms/' \
++        -e 's/^apple-bcm-firmware$/apple-bcm-firmware-fetcher/' | sort -u
+ )
+ 
+ # With --local-source we already built these omarchy* packages directly into
+@@ -223,6 +287,18 @@ if [[ -n ${LOCAL_OMARCHY_BUILD:-} ]]; then
+   )
+ fi
+ 
++# ZFS is built into the local [aur] repo above. The offline download uses the
++# network-only online conf and cannot see that repo, so drop these from the
++# download list; the copy step below places the built packages in the mirror.
++mapfile -t all_packages < <(
++  printf '%s\n' "${all_packages[@]}" |
++    grep -Fxv -e zfs-utils -e zfs-dkms -e zfsbootmenu -e perl-boolean || true
++)
++
++# zfsbootmenu (local AUR package) pulls these from the Arch repos at target
++# install time, so they must be in the offline mirror too.
++all_packages+=(kexec-tools mbuffer perl-sort-versions perl-yaml-pp fzf)
++
+ mkdir -p /tmp/offlinedb
+ download_offline_packages() {
+   pacman --config /configs/pacman-online-${OMARCHY_MIRROR}.conf --noconfirm -Syw \
+@@ -251,6 +327,18 @@ if ! resolved_package_files="$(
+ fi
+ mapfile -t required_package_files <<< "$resolved_package_files"
+ 
++# ZFS packages are AUR-built and already sitting in the local repo. Copy them
++# into the offline mirror and add them to the keep-set (the -S --print
++# resolution above never saw them, so prune would otherwise drop them).
++for zfs_pkg in "$zfs_repo_dir"/zfs-utils-*.pkg.tar.zst \
++               "$zfs_repo_dir"/zfs-dkms-*.pkg.tar.zst \
++               "$zfs_repo_dir"/zfsbootmenu-*.pkg.tar.zst \
++               "$zfs_repo_dir"/perl-boolean-*.pkg.tar.zst; do
++  [[ -f $zfs_pkg ]] || continue
++  cp -f "$zfs_pkg" "$offline_mirror_dir/"
++  required_package_files+=("${zfs_pkg##*/}")
++done
++
+ # The online transaction intentionally excludes packages built from the local
+ # checkouts. Add those exact artifacts back to the keep-set after verifying
+ # that the local build left exactly one file for each selected package name.
+diff --git a/configs/airootfs/etc/cloud/cloud.cfg.d/99-omarchy-disable.cfg b/configs/airootfs/etc/cloud/cloud.cfg.d/99-omarchy-disable.cfg
+new file mode 100644
+index 0000000..396783e
+--- /dev/null
++++ b/configs/airootfs/etc/cloud/cloud.cfg.d/99-omarchy-disable.cfg
+@@ -0,0 +1,5 @@
++# Omarchy uses its own cidata loader (omarchy-cidata-load) for unattended
++# installs. cloud-init ships as a dependency and would otherwise grab the
++# NoCloud "CIDATA" drive first (SSH host key generation, etc.), racing the
++# Omarchy installer. Disable every datasource so cloud-init is inert.
++datasource_list: [ None ]
+diff --git a/configs/airootfs/root/.automated_script.sh b/configs/airootfs/root/.automated_script.sh
+index 16904f8..7edadd8 100644
+--- a/configs/airootfs/root/.automated_script.sh
++++ b/configs/airootfs/root/.automated_script.sh
+@@ -30,10 +30,10 @@ fi
+ 
+ # Tokyo Night palette so the live VT matches the installed look.
+ set_tokyo_night_colors() {
+-  echo -en "\e]P01a1b26"; echo -en "\e]P1f7768e"; echo -en "\e]P29ece6a"
++  echo -en "\e]P01a1b26"; echo -en "\e]P1f7768e"; echo -en "\e]P2e0af68"
+   echo -en "\e]P3e0af68"; echo -en "\e]P47aa2f7"; echo -en "\e]P5bb9af7"
+   echo -en "\e]P67dcfff"; echo -en "\e]P7a9b1d6"; echo -en "\e]P8414868"
+-  echo -en "\e]P9f7768e"; echo -en "\e]PA9ece6a"; echo -en "\e]PBe0af68"
++  echo -en "\e]P9f7768e"; echo -en "\e]PAffd7af"; echo -en "\e]PBe0af68"
+   echo -en "\e]PC7aa2f7"; echo -en "\e]PDbb9af7"; echo -en "\e]PE7dcfff"
+   echo -en "\e]PFc0caf5"
+   echo -en "\033[0m"
+diff --git a/configs/airootfs/root/configurator b/configs/airootfs/root/configurator
+index 2960c06..44f3482 100644
+--- a/configs/airootfs/root/configurator
++++ b/configs/airootfs/root/configurator
+@@ -35,6 +35,13 @@ if [[ ! -r $DISK_PARTITIONING ]]; then
+ fi
+ source "$DISK_PARTITIONING"
+ 
++# ZFS root helpers (mode "zfs"): full-disk encrypted pool + ZFSBootMenu.
++# Absent on stock builds, so tolerate a missing file.
++ZFS_HELPERS="${ZFS_HELPERS:-/usr/share/omarchy-iso/zfs.sh}"
++[[ -r $ZFS_HELPERS ]] ||
++  ZFS_HELPERS="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../usr/share/omarchy-iso/zfs.sh"
++[[ -r $ZFS_HELPERS ]] && source "$ZFS_HELPERS"
++
+ LOGO_WIDTH=$(awk '{ if (length > max) max = length } END { print max+0 }' "$LOGO_PATH")
+ 
+ export GUM_CONFIRM_PROMPT_FOREGROUND="6"
+@@ -124,14 +131,15 @@ greeter() {
+ 
+   tagline="Beautiful, Fun & Agentic Linux by DHH"
+   tpad=$(((cols - ${#tagline}) / 2)); (( tpad < 0 )) && tpad=0
+-  printf '\033[%d;%dH%s' "$tagline_row" "$((tpad + 1))" "$tagline"
++  printf '\033[%d;%dH\033[33m%s\033[0m' "$tagline_row" "$((tpad + 1))" "$tagline"
+ 
+   hint="Press Return to Start Install"
+   hpad=$(((cols - ${#hint}) / 2)); (( hpad < 0 )) && hpad=0
+-  printf '\033[%d;%dH\033[2m%s\033[0m' "$hint_row" "$((hpad + 1))" "$hint"
++  printf '\033[%d;%dH\033[2;33m%s\033[0m' "$hint_row" "$((hpad + 1))" "$hint"
+ 
+-  # ColorShift the logo: a green base (indexed color 2) with a cyan accent (6)
+-  # drifting through, settling on green. Indexed ANSI colors, not hex — the
++  # ColorShift the logo: an amber base (indexed color 2, remapped to amber in
++  # the VT palette) with a lighter amber accent (10) drifting through, settling
++  # on amber. Indexed ANSI colors, not hex — the
+   # framebuffer console can't render truecolor faithfully (it crushes the
+   # palette to a muddy lavender), but the 16 indexed colors map to the Tokyo
+   # Night palette and render true. --xterm-colors is what keeps them indexed:
+@@ -156,7 +164,7 @@ greeter() {
+     --reuse-canvas \
+     --xterm-colors \
+     colorshift \
+-    --gradient-stops 2 10 6 10 \
++    --gradient-stops 2 10 2 10 \
+     --gradient-frames 3 \
+     --cycles 1000 \
+     --final-gradient-stops 2 \
+@@ -191,7 +199,9 @@ step() {
+ 
+ # Padded body text to line up with the logo and gum widgets.
+ say() {
+-  gum style --padding "0 0 0 $PADDING_LEFT" "$@"
++  # Amber by default; callers may still pass --foreground 1/8 to override
++  # (gum style takes the last --foreground).
++  gum style --foreground 3 --padding "0 0 0 $PADDING_LEFT" "$@"
+ }
+ 
+ notice() {
+@@ -861,6 +871,95 @@ run_partition_execute() {
+ _EOF_
+ }
+ 
++# Execute the ZFS full-disk install: create the natively-encrypted pool, mount
++# it, and write the pre-mounted (mode "zfs") configuration. Runs after the user
++# step so the pool passphrase is the user's password. The orchestrator then
++# installs packages into the mounted target and finishes the ZFSBootMenu boot.
++run_zfs_execute() {
++  local dry=false
++  [[ "${1:-}" == "dry" ]] && dry=true
++
++  esp_mount_in_target=/efi
++  kernel_choice=$(detect_kernel)
++  efi_dev="<assigned at creation>"
++
++  if $dry; then
++    say "[dry] would create an ESP + natively-encrypted ZFS pool on $disk"
++    say "[dry] kernel=$kernel_choice"
++  else
++    step "Creating the encrypted ZFS pool on $disk"
++    zfs_prepare_target "$disk" "$password" "$kernel_choice" "$esp_mount_in_target" ||
++      disk_abort_hook "ZFS setup failed"
++    efi_dev=$(partition_path "$disk" 1)
++  fi
++
++  cat <<-_EOF_ >user_configuration.json
++{
++    "app_config": null,
++    "archinstall-language": "English",
++    "auth_config": {},
++    "audio_config": { "audio": "pipewire" },
++    "bootloader_config": { "bootloader": "Limine", "uki": false, "removable": false },
++    "custom_commands": [],
++    "omarchy_install": {
++        "mode": "zfs",
++        "target_mount": "/mnt",
++        "boot": {
++            "esp_mount": "$esp_mount_in_target"
++        },
++        "storage": {
++            "esp_device": "$efi_dev",
++            "zfs_pool": "zroot",
++            "zfs_dataset": "omarchy",
++            "zfs_disk": "$disk",
++            "kernel": "$kernel_choice"
++        }
++    },
++    "disk_config": {
++        "config_type": "pre_mounted_config",
++        "mountpoint": "/mnt"
++    },
++    "hostname": "$hostname",
++    "kernels": [ "$kernel_choice" ],
++    "network_config": { "type": "iso" },
++    "ntp": true,
++    "parallel_downloads": 8,
++    "script": null,
++    "services": [],
++    "swap": false,
++    "timezone": "$timezone",
++    "locale_config": {
++        "kb_layout": "$keyboard",
++        "sys_enc": "UTF-8",
++        "sys_lang": "en_US.UTF-8"
++    },
++    "mirror_config": {
++        "custom_repositories": [],
++        "custom_servers": [
++            {"url": "https://mirror.omarchy.org/\$repo/os/\$arch"},
++            {"url": "https://mirror.rackspace.com/archlinux/\$repo/os/\$arch"},
++            {"url": "https://geo.mirror.pkgbuild.com/\$repo/os/\$arch"}
++        ],
++        "mirror_regions": {},
++        "optional_repositories": []
++    },
++    "packages": [
++        "base-devel",
++        "git",
++        "omarchy-keyring",
++        "$OMARCHY_SETTINGS_PACKAGE",
++        "$OMARCHY_RUNTIME_PACKAGE"
++    ],
++    "profile_config": {
++        "gfx_driver": null,
++        "greeter": null,
++        "profile": {}
++    },
++    "version": "3.0.9"
++}
++_EOF_
++}
++
+ disk_form() {
+   step "Let's select where to install Omarchy..."
+ 
+@@ -932,8 +1031,19 @@ requires_full_disk_install() {
+   [[ -z "$free_space_b" || "$free_space_b" -eq 0 ]]
+ }
+ 
++# ZFS is offered only when the live environment ships the helpers + tools.
++# A fresh (empty) disk has no partition table, which makes
++# requires_full_disk_install true; but that must not hide ZFS, only the
++# free-space mode. So this gates the picker decision as well.
++zfs_install_available() {
++  declare -F zfs_prepare_target >/dev/null 2>&1 && command -v zpool >/dev/null 2>&1
++}
++
+ install_mode_form() {
+   local choices=("Full disk install")
++  if zfs_install_available; then
++    choices+=("ZFS install (full disk, encrypted, ZFSBootMenu)")
++  fi
+ 
+   # The free-space/protected path registers an EFI boot entry and is UEFI-only.
+   # Full-disk installs still support BIOS through the orchestrator's BIOS branch.
+@@ -999,9 +1109,11 @@ select_installation() {
+       full_disk_only=false
+     fi
+ 
+-    # With no free-space option to offer, a full-disk install is the only
+-    # mode, so skip the picker and go straight to the overwrite confirm.
+-    if $full_disk_only; then
++    # An empty or full disk has no unallocated space, so the free-space mode
++    # is out. But when ZFS is on offer there are still two full-disk modes
++    # (btrfs+Limine or ZFS+ZFSBootMenu), so show the picker; skip it only when
++    # "Full disk install" is genuinely the only choice.
++    if $full_disk_only && ! zfs_install_available; then
+       install_mode="Full disk install"
+     else
+       install_mode_form
+@@ -1023,6 +1135,13 @@ select_installation() {
+           return 0
+         fi
+         ;;
++      "ZFS install"*)
++        if confirm_disk_overwrite; then
++          install_target="zfs"
++          encrypt_installation=true
++          return 0
++        fi
++        ;;
+       "Choose a different disk")
+         disk_form
+         ;;
+@@ -1091,6 +1210,15 @@ if [[ $install_target == "free_space" ]]; then
+   exit 0
+ fi
+ 
++if [[ $install_target == "zfs" ]]; then
++  run_zfs_execute "$@"
++
++  if [[ ${1:-} == "dry" ]]; then
++    print_dry_run_files
++  fi
++  exit 0
++fi
++
+ # Setup partition layout
+ disk_size=$(lsblk -bdno SIZE "$disk")
+ mib=$((1024 * 1024))
+diff --git a/configs/airootfs/usr/share/omarchy-iso/disk-partitioning.sh b/configs/airootfs/usr/share/omarchy-iso/disk-partitioning.sh
+index ac818b0..aacae84 100644
+--- a/configs/airootfs/usr/share/omarchy-iso/disk-partitioning.sh
++++ b/configs/airootfs/usr/share/omarchy-iso/disk-partitioning.sh
+@@ -20,7 +20,7 @@ created_partition_number=""
+ # Compute partition device path, handling NVMe/mmcblk's pN naming.
+ partition_path() {
+   local _disk="$1" _num="$2"
+-  if [[ "$_disk" == *nvme* || "$_disk" == *mmcblk* ]]; then
++  if [[ "$_disk" == *nvme* || "$_disk" == *mmcblk* || "$_disk" == *loop* ]]; then
+     echo "${_disk}p${_num}"
+   else
+     echo "${_disk}${_num}"
+diff --git a/configs/airootfs/usr/share/omarchy-iso/orchestrator/context.py b/configs/airootfs/usr/share/omarchy-iso/orchestrator/context.py
+index 02494b0..515c727 100644
+--- a/configs/airootfs/usr/share/omarchy-iso/orchestrator/context.py
++++ b/configs/airootfs/usr/share/omarchy-iso/orchestrator/context.py
+@@ -149,6 +149,10 @@ class InstallContext:
+     def is_protected(self) -> bool:
+         return self.mode == "protected"
+ 
++    @property
++    def is_zfs(self) -> bool:
++        return self.mode == "zfs"
++
+ 
+ def _strip_account_fields(arch_configuration: dict) -> None:
+     """Remove every field archinstall reads to create users or set a root
+diff --git a/configs/airootfs/usr/share/omarchy-iso/orchestrator/main.py b/configs/airootfs/usr/share/omarchy-iso/orchestrator/main.py
+index 9b6ebf5..ec2a7b1 100644
+--- a/configs/airootfs/usr/share/omarchy-iso/orchestrator/main.py
++++ b/configs/airootfs/usr/share/omarchy-iso/orchestrator/main.py
+@@ -36,6 +36,7 @@ def build_phases(ctx: InstallContext):
+         run_system_finalizer,
+         stage_provisioning_state,
+         finalize_limine_boot,
++        finalize_zfs_boot,
+         run_chroot_finalizer,
+         configure_dns_resolver,
+         configure_login,
+@@ -54,7 +55,8 @@ def build_phases(ctx: InstallContext):
+         # Before finalize_limine_boot: the deferred-provisioning cryptkey drop-in and keyfile
+         # must be in place for the final UKI build.
+         ("Staging provisioning",          stage_provisioning_state),
+-        ("Finalizing Limine boot",     finalize_limine_boot),
++        ("Finalizing ZFS boot", finalize_zfs_boot) if ctx.is_zfs
++        else ("Finalizing Limine boot", finalize_limine_boot),
+         ("Finalizing user",            run_chroot_finalizer),
+         ("Configuring login",          configure_login),
+         ("Configuring SSH access",     configure_ssh_access),
+diff --git a/configs/airootfs/usr/share/omarchy-iso/orchestrator/phases_impl.py b/configs/airootfs/usr/share/omarchy-iso/orchestrator/phases_impl.py
+index 1ebd4ce..8df31be 100644
+--- a/configs/airootfs/usr/share/omarchy-iso/orchestrator/phases_impl.py
++++ b/configs/airootfs/usr/share/omarchy-iso/orchestrator/phases_impl.py
+@@ -209,10 +209,44 @@ def _install_disk(ctx: InstallContext) -> str | None:
+ # ─────────────────────────────────────────────────────────────────────────────
+ 
+ def prepare_install_target(ctx: InstallContext) -> None:
+-    if ctx.is_protected:
++    if ctx.is_zfs:
++        prepare_zfs_pool(ctx)
++    elif ctx.is_protected:
+         verify_protected_mounts(ctx)
+ 
+ 
++def prepare_zfs_pool(ctx: InstallContext) -> None:
++    """Interactive installs already built and mounted the pool in the
++    configurator. Cidata/autoinstall configs have not, so build it here from
++    the disk named in storage."""
++    if _is_mountpoint(ctx.target):
++        return
++    storage = _storage_intent(ctx)
++    disk = storage.get("zfs_disk")
++    if not disk:
++        raise RuntimeError("zfs mode: storage.zfs_disk missing from the config")
++    pass_phrase = ctx.user_credentials.get("encryption_password")
++    if not pass_phrase:
++        raise RuntimeError("zfs mode: encryption_password missing from credentials")
++    kernel = storage.get("kernel") or (
++        ctx.user_configuration.get("kernels") or ["linux-omarchy"]
++    )[0]
++    boot = _boot_intent(ctx)
++    info(f"› creating encrypted ZFS pool on {disk}")
++    env = dict(os.environ, OMARCHY_ZFS_PASSPHRASE=pass_phrase)
++    subprocess.run(
++        [
++            "bash", "-c",
++            'source "${DISK_PARTITIONING:-/usr/share/omarchy-iso/disk-partitioning.sh}"; '
++            'source /usr/share/omarchy-iso/zfs.sh; '
++            'zfs_prepare_target "$1" "$OMARCHY_ZFS_PASSPHRASE" "$2" "$3"',
++            "zfs", disk, kernel, boot["esp_mount"],
++        ],
++        env=env,
++        check=True,
++    )
++
++
+ def arch_install_system(ctx: InstallContext) -> None:
+     """Install the target system from the archinstall JSON.
+ 
+@@ -324,6 +358,11 @@ def arch_install_system(ctx: InstallContext) -> None:
+ 
+ 
+ def _configure_limine_boot(ctx: InstallContext, installer, config) -> None:
++    if ctx.is_zfs:
++        # ZFS uses ZFSBootMenu. archinstall's JSON has no "no bootloader" value
++        # (only Systemd-boot/Grub/Efistub/Limine), so it names Limine to pass
++        # validation, but we install ZBM ourselves in finalize_zfs_boot.
++        return
+     if not arch.bootloader_enabled(config):
+         return
+     if not arch.is_limine(config):
+@@ -747,6 +786,11 @@ def _runtime_package_list(ctx: InstallContext) -> list[str]:
+             continue
+         if s not in already_installed and s not in pkgs:
+             pkgs.append(s)
++    if ctx.is_zfs:
++        # ZFS stack from the offline mirror (built from AUR during the ISO build).
++        for p in ("zfs-utils", "zfs-dkms", "zfsbootmenu"):
++            if p not in pkgs:
++                pkgs.append(p)
+     return pkgs
+ 
+ 
+@@ -837,6 +881,21 @@ def _esp_device(ctx: InstallContext) -> str:
+ 
+ 
+ def _write_pre_mounted_fstab(ctx: InstallContext) -> None:
++    if ctx.is_zfs:
++        # ZFS datasets mount from their own properties; only the ESP goes in
++        # fstab. nofail so a missing ESP can never drop us into emergency mode.
++        boot = _boot_intent(ctx)
++        esp_uuid = _blkid_uuid(_esp_device(ctx))
++        lines = [
++            "# /etc/fstab — generated by Omarchy ISO (ZFS root)",
++            "# <device>  <mount>  <fs>  <options>  <dump>  <pass>",
++            f"UUID={esp_uuid}  {boot['esp_mount']}  vfat  "
++            "umask=0077,nofail,x-systemd.automount  0 0",
++            "",
++        ]
++        (ctx.target / "etc" / "fstab").write_text("\n".join(lines))
++        return
++
+     boot = _boot_intent(ctx)
+     btrfs_dev = _btrfs_root_device(ctx)
+     btrfs_uuid = _blkid_uuid(btrfs_dev)
+@@ -941,6 +1000,10 @@ def configure_hibernation(ctx: InstallContext) -> None:
+     Limine UKI build still happens later in finalize_limine_boot after this
+     writes the resume hook and kernel cmdline drop-in.
+     """
++    if ctx.is_zfs:
++        _debug_log(ctx, "skipping hibernation: ZFS root has no supported swap/resume")
++        return
++
+     setup = ctx.target / "usr" / "bin" / "omarchy-hibernation-setup"
+     if not setup.exists():
+         _debug_log(ctx, "skipping hibernation: /usr/bin/omarchy-hibernation-setup is not installed")
+@@ -1135,6 +1198,25 @@ def _run_target_setup_command(ctx: InstallContext, cmd: list[str], *, user: str
+ 
+ 
+ def run_system_finalizer(ctx: InstallContext) -> None:
++    if ctx.is_zfs:
++        # Omarchy's config scripts assume btrfs + Limine snapshots. On a ZFS
++        # root, snapper create-config fails (no btrfs) and drags in dbus errors,
++        # aborting the phase. Neutralize the btrfs-only script first; ZFS uses
++        # native snapshots + ZFSBootMenu boot environments instead.
++        for name in ("snapper.sh",):
++            script = ctx.target / "usr/share/omarchy/install/config" / name
++            if script.exists():
++                backup = script.with_name(name + ".zfs-orig")
++                if not backup.exists():
++                    script.rename(backup)
++                script.write_text(
++                    "#!/bin/bash\n"
++                    "# Skipped by the Omarchy ZFS installer: btrfs/snapper snapshots\n"
++                    "# do not apply to a ZFS root.\n"
++                    "exit 0\n"
++                )
++                script.chmod(0o755)
++
+     if ctx.defer_provisioning:
+         cmd = ["/usr/bin/omarchy-apply-system", "--defer-provisioning", "--first-install"]
+     else:
+@@ -1271,6 +1353,40 @@ def _stage_provisioning_luks_unlock(ctx: InstallContext, provisioning_dir) -> No
+     files_dropin.write_text("FILES+=(/etc/omarchy/provisioning.key)\n")
+ 
+ 
++def finalize_zfs_boot(ctx: InstallContext) -> None:
++    """ZFS counterpart of finalize_limine_boot: busybox+zfs initramfs and the
++    ZFSBootMenu EFI bundle. No Limine, no UKI."""
++    if not ctx.is_zfs:
++        return
++    storage = _storage_intent(ctx)
++    boot = _boot_intent(ctx)
++    kernel = storage.get("kernel") or (
++        ctx.user_configuration.get("kernels") or ["linux-omarchy"]
++    )[0]
++    info("› configuring ZFS initramfs + ZFSBootMenu")
++    subprocess.run(
++        [
++            "bash", "-c", 'source "$1"; shift; zfs_finalize_boot "$@"',
++            "zfs.sh", "/usr/share/omarchy-iso/zfs.sh",
++            str(ctx.target), kernel, boot["esp_mount"],
++        ],
++        check=True,
++    )
++
++
++def _validate_zfs_boot(ctx: InstallContext) -> None:
++    boot = _boot_intent(ctx)
++    esp_mount = ctx.target / boot["esp_mount"].lstrip("/")
++    efi = esp_mount / "EFI" / "BOOT" / "BOOTX64.EFI"
++    if not efi.exists() or efi.stat().st_size == 0:
++        raise RuntimeError(f"{efi} missing or empty — ZFSBootMenu would not boot")
++    zbm_dir = esp_mount / "EFI" / "zbm"
++    if not any(zbm_dir.glob("*.EFI")):
++        raise RuntimeError(f"no ZFSBootMenu EFI bundle in {zbm_dir}")
++    if not list((ctx.target / "boot").glob("initramfs-*.img")):
++        raise RuntimeError("no initramfs built in the ZFS target")
++
++
+ def finalize_limine_boot(ctx: InstallContext) -> None:
+     """Finalize Limine after target system setup has written all dynamic
+     boot drop-ins (hibernation, hardware quirks, protected-mode ESP settings).
+@@ -1648,6 +1764,10 @@ def _tailscale_authkey(path: Path) -> str:
+ # ─────────────────────────────────────────────────────────────────────────────
+ 
+ def validate_boot(ctx: InstallContext) -> None:
++    if ctx.is_zfs:
++        _validate_zfs_boot(ctx)
++        return
++
+     _assert_boot_hooks_restored(ctx)
+     _validate_kernel_headers(ctx)
+ 
+diff --git a/configs/airootfs/usr/share/omarchy-iso/zfs.sh b/configs/airootfs/usr/share/omarchy-iso/zfs.sh
+new file mode 100644
+index 0000000..891ea5e
+--- /dev/null
++++ b/configs/airootfs/usr/share/omarchy-iso/zfs.sh
+@@ -0,0 +1,279 @@
++# ZFS root helpers for the Omarchy installer (mode "zfs").
++#
++# Full disk, ONE natively-encrypted pool (aes-256-gcm, passphrase), /boot inside
++# the encrypted root, ZFSBootMenu on the ESP. No btrfs, no Limine, no
++# hibernation. Snapshoty: ZFS + boot environments ZBM.
++#
++# Sourced by the configurator (zfs_prepare_target) and by the orchestrator's
++# finalize phase (zfs_finalize_boot). Verified recipe: see
++# ~/work/zfs-proto/proto1-build.sh.
++#
++# Sourced, not executed. The configurator provides disk_step/disk_abort_hook;
++# tests/other callers get plain fallbacks.
++
++ZFS_POOL="${ZFS_POOL:-zroot}"
++ZFS_DATASET="${ZFS_DATASET:-omarchy}"
++ZFS_KEYFILE=/tmp/omarchy-zfs.key
++
++_zfs_say() { printf '\n\033[1;36m==> %s\033[0m\n' "$*"; }
++
++# Standalone use from the orchestrator: pull in the partition helpers if the
++# configurator has not already sourced them, and provide an abort fallback.
++if ! declare -F partition_path >/dev/null 2>&1; then
++  # shellcheck disable=SC1091
++  source "${DISK_PARTITIONING:-/usr/share/omarchy-iso/disk-partitioning.sh}"
++fi
++if ! declare -F disk_abort_hook >/dev/null 2>&1; then
++  disk_abort_hook() { printf 'Error: %s\n' "$1" >&2; exit 1; }
++fi
++
++# ── PREPARE (runs in the live ISO, before archinstall) ───────────────────────
++# Args: <disk> <passphrase> <kernel> <esp_mount_in_target>
++# Creates the pool and mounts the target so archinstall can install into it
++# with config_type=pre_mounted_config. Idempotent enough to re-run after a
++# failed attempt (wipes the disk).
++zfs_prepare_target() {
++  local disk="$1" pass="${2:-${OMARCHY_ZFS_PASSPHRASE:-}}" kernel="${3:-linux-omarchy}" esp_mount="${4:-/boot}"
++  (( ${#pass} >= 8 )) ||
++    disk_abort_hook "Haslo szyfrowania ZFS musi miec min. 8 znakow (jest ${#pass})"
++  local mib=$((1024 * 1024)) gib=$((1024 * 1024 * 1024))
++  local disk_size boot_start boot_size main_start main_size
++  local efi_dev pool_dev
++
++  disk_size=$(lsblk -bdno SIZE "$disk")
++  disk_size=$((disk_size / mib * mib))
++  boot_start=$mib
++  boot_size=$gib
++  # 1 MiB gap after the ESP: parted rejects a start that lands on the previous
++  # partition's last sector, so a flush start fails with "closest location".
++  main_start=$((boot_start + boot_size + mib))
++  main_size=$((disk_size - main_start - mib))
++
++  disk_step "wiping $disk" sgdisk --zap-all "$disk"
++  # zap-all leaves the disk label-less; parted mkpart needs a table first.
++  disk_step "initializing GPT on $disk" parted --script "$disk" mklabel gpt
++  partprobe "$disk" 2>/dev/null || true; udevadm settle; sleep 1
++  disk_step "creating ESP on $disk" \
++    parted --script "$disk" mkpart primary fat32 "${boot_start}B" "$((boot_start + boot_size))B"
++  disk_step "flagging ESP" parted --script "$disk" set 1 esp on
++  disk_step "creating ZFS partition on $disk" \
++    parted --script "$disk" mkpart primary "${main_start}B" "$((main_start + main_size))B"
++  partprobe "$disk"; udevadm settle; sleep 1
++
++  efi_dev=$(partition_path "$disk" 1)
++  pool_dev=$(partition_path "$disk" 2)
++  wait_for_device "$efi_dev" || disk_abort_hook "ESP $efi_dev never appeared"
++  wait_for_device "$pool_dev" || disk_abort_hook "ZFS partition $pool_dev never appeared"
++  disk_step "clearing ESP signatures" wipefs -af "$efi_dev"
++  disk_step "clearing ZFS partition signatures" wipefs -af "$pool_dev"
++  disk_step "creating the ESP filesystem on $efi_dev" mkfs.vfat -F32 -n OMARCHY_EFI "$efi_dev"
++
++  # Key file lives on the (host) live env only long enough to create the pool;
++  # it is copied into the encrypted target and becomes the initramfs key.
++  printf '%s' "$pass" >"$ZFS_KEYFILE"; chmod 600 "$ZFS_KEYFILE"
++
++  _zfs_say "Creating encrypted pool $ZFS_POOL"
++  disk_step "creating the ZFS pool" \
++    zpool create -f -o ashift=12 -o autotrim=on -o cachefile=none \
++      -O compression=lz4 -O acltype=posixacl -O xattr=sa -O relatime=on \
++      -O dnodesize=auto -O normalization=formD \
++      -O mountpoint=none -O canmount=off \
++      -O encryption=aes-256-gcm -O keyformat=passphrase \
++      -O keylocation="file://$ZFS_KEYFILE" \
++      -R /mnt "$ZFS_POOL" "$pool_dev"
++
++  disk_step "creating ROOT dataset" zfs create -o mountpoint=none "$ZFS_POOL/ROOT"
++  disk_step "creating root dataset" \
++    zfs create -o mountpoint=/ -o canmount=noauto "$ZFS_POOL/ROOT/$ZFS_DATASET"
++  disk_step "creating home dataset" zfs create -o mountpoint=/home "$ZFS_POOL/home"
++  disk_step "creating var dataset" zfs create -o mountpoint=none "$ZFS_POOL/var"
++  # -p so intermediate datasets (var/cache) are created too.
++  disk_step "creating var/log dataset" \
++    zfs create -p -o mountpoint=/var/log "$ZFS_POOL/var/log"
++  disk_step "creating pkg cache dataset" \
++    zfs create -p -o mountpoint=/var/cache/pacman/pkg "$ZFS_POOL/var/cache/pacman"
++  disk_step "setting bootfs" zpool set bootfs="$ZFS_POOL/ROOT/$ZFS_DATASET" "$ZFS_POOL"
++
++  _zfs_say "Export / reimport / mount"
++  disk_step "exporting the pool" zpool export "$ZFS_POOL"
++  disk_step "importing the pool" zpool import -N -R /mnt "$ZFS_POOL"
++  disk_step "loading the encryption key" zfs load-key "$ZFS_POOL"
++  disk_step "mounting root" zfs mount "$ZFS_POOL/ROOT/$ZFS_DATASET"
++  disk_step "mounting home" zfs mount "$ZFS_POOL/home"
++  disk_step "mounting var/log" zfs mount "$ZFS_POOL/var/log"
++  disk_step "mounting pkg cache" zfs mount "$ZFS_POOL/var/cache/pacman"
++  # /boot must live on the ZFS root: ZFSBootMenu mounts the BE and reads the
++  # kernel from /boot, and a separate ESP mounted at /boot is invisible there.
++  # The ESP (ZBM's EFI bundle) goes to $esp_mount (default /efi).
++  mkdir -p /mnt/boot
++  mkdir -p "/mnt$esp_mount"
++  disk_step "mounting ESP" mount "$efi_dev" "/mnt$esp_mount"
++
++  # Key inside the encrypted target; pool points at it. ZBM overrides the
++  # file:// keylocation to prompt (it cannot read it), so one prompt, and the
++  # target initramfs (which carries the same file) does not prompt again.
++  mkdir -p /mnt/etc/zfs
++  cp "$ZFS_KEYFILE" /mnt/etc/zfs/zroot.key
++  chmod 000 /mnt/etc/zfs/zroot.key
++  zfs set keylocation=file:///etc/zfs/zroot.key "$ZFS_POOL"
++
++  # OS kernel command line (busybox `zfs` hook mounts root from bootfs).
++  # zfs_force=1 makes the hook import with `zpool import -f`. The pool is left
++  # imported by the live installer (and re-imported by ZFSBootMenu) and is never
++  # cleanly exported, so a plain import refuses with "pool was previously in use
++  # from another system" -- the initramfs init then exits and the kernel panics
++  # with "Attempted to kill init" before root is ever mounted.
++  zfs set org.zfsbootmenu:commandline="zfs=bootfs rw zfs_force=1" \
++    "$ZFS_POOL/ROOT/$ZFS_DATASET"
++
++  # fstab: only the ESP. ZFS datasets mount from their properties. nofail so a
++  # missing ESP can never drop the system into emergency mode.
++  local esp_uuid
++  esp_uuid=$(blkid -s UUID -o value "$efi_dev")
++  cat >/mnt/etc/fstab <<EOF
++# /etc/fstab — generated by Omarchy ISO (ZFS root)
++# <device>  <mount>  <fs>  <options>  <dump>  <pass>
++UUID=$esp_uuid  $esp_mount  vfat  umask=0077,nofail,x-systemd.automount  0 0
++EOF
++
++  # Stable hostid so the pool imports deterministically.
++  zgenhostid -f 0x00bab10c 2>/dev/null || true
++  [[ -f /etc/hostid ]] && cp -f /etc/hostid /mnt/etc/hostid
++
++  mountpoint -q /mnt || disk_abort_hook "target /mnt is not mounted"
++}
++
++# ── FINALIZE (runs in the target chroot, after package install) ──────────────
++# Configures initramfs (busybox hooks + zfs + key) and installs ZFSBootMenu.
++# Args: <target> <kernel> <efi_binary_path>
++zfs_finalize_boot() {
++  local target="$1" kernel="$2" esp_mount="$3"
++  local keyfile="/etc/zfs/zroot.key"
++
++  _zfs_say "Purging the Limine/Snapper stack (unused on a ZFS root)"
++  # The omarchy meta-package pulls limine, limine-mkinitcpio-hook,
++  # limine-snapper-sync and snapper. On ZFS these are actively wrong:
++  # limine-mkinitcpio-hook installs its own pacman hook that builds a UKI +
++  # limine.conf instead of leaving a plain vmlinuz/initramfs for ZFSBootMenu,
++  # and it drives a btrfs-only HOOKS set. Remove the whole stack (ignoring the
++  # omarchy dependency), plus any leftover limine mkinitcpio boot hooks.
++  arch-chroot "$target" bash -euo pipefail -c '
++    pacman -Rdd --noconfirm limine limine-mkinitcpio-hook limine-snapper-sync snapper 2>/dev/null || true
++    rm -rf /etc/boot/hooks/pre.d /etc/boot/hooks/post.d
++    rm -f /etc/pacman.d/hooks/90-mkinitcpio-install.hook
++  '
++
++  _zfs_say "Configuring ZFS initramfs hooks"
++  # omarchy_hooks.conf OVERRIDES HOOKS with a btrfs+LUKS+Limine set (no zfs) and
++  # omarchy_resume.conf adds a btrfs-swap resume hook. Neither fits ZFS: move
++  # them aside so the ZFS set below is authoritative.
++  arch-chroot "$target" bash -euo pipefail -c '
++    set -e
++    mkdir -p /etc/mkinitcpio.conf.d
++    for f in omarchy_hooks.conf omarchy_resume.conf; do
++      [ -e "/etc/mkinitcpio.conf.d/$f" ] && mv -f "/etc/mkinitcpio.conf.d/$f" "/etc/mkinitcpio.conf.d/$f.zfs-orig"
++    done
++    cat > /etc/mkinitcpio.conf.d/zz-omarchy-zfs.conf <<EOF
++HOOKS=(base udev plymouth autodetect microcode modconf kms keyboard keymap consolefont block zfs filesystems fsck)
++FILES+=(/etc/zfs/zroot.key)
++EOF
++    rm -rf /etc/boot/hooks/pre.d /etc/boot/hooks/post.d
++    rm -f /etc/pacman.d/hooks/90-mkinitcpio-install.hook
++  '
++
++  # New Arch no longer ships kernel presets in /etc/mkinitcpio.d (a pacman hook
++  # generates them). Create an explicit preset so mkinitcpio -P has work to do.
++  #
++  # ALL_config MUST stay unset (commented), exactly like the stock
++  # /usr/share/mkinitcpio/hook.preset. Setting it makes process_preset pass
++  # "-c" to the nested mkinitcpio, and mkinitcpio only reads the
++  # /etc/mkinitcpio.conf.d drop-ins when no config was given via -c/preset
++  # (mkinitcpio sets _optconfd=0 for -c). Our zfs HOOKS/FILES live in
++  # zz-omarchy-zfs.conf, so with ALL_config set the initramfs gets built from
++  # the stock systemd hook set with no zfs -- root then fails to mount and
++  # systemd falls back to gpt-auto-root. Leave ALL_config commented out.
++  local pb pkgbase
++  for pb in "$target"/usr/lib/modules/*/pkgbase; do
++    pkgbase=$(cat "$pb")
++    cat >"$target/etc/mkinitcpio.d/${pkgbase}.preset" <<EOF
++#ALL_config="/etc/mkinitcpio.conf"
++ALL_kver="/boot/vmlinuz-${pkgbase}"
++PRESETS=('default')
++default_image="/boot/initramfs-${pkgbase}.img"
++EOF
++  done
++
++  _zfs_say "Configuring ZFSBootMenu"
++  mkdir -p "$target/etc/zfsbootmenu"
++  cat >"$target/etc/zfsbootmenu/config.yaml" <<EOF
++Global:
++  ManageImages: true
++  BootMountPoint: $esp_mount
++Components:
++  Enabled: false
++EFI:
++  Enabled: true
++  ImageDir: $esp_mount/EFI/zbm
++  Versions: false
++Kernel:
++  CommandLine: "ro quiet loglevel=4"
++EOF
++
++  _zfs_say "Enabling ZFS dataset auto-mount on boot"
++  # Datasets with canmount=on (home, /var/log, pkg cache) are mounted at boot by
++  # systemd's zfs-mount-generator, which turns /etc/zfs/zfs-list.cache/<pool>
++  # into .mount units pulled in by local-fs.target. zfs-zed refreshes that cache
++  # on pool import, but on a cold boot the generator runs before the OS imports
++  # the pool, so a fresh install would otherwise leave every non-root dataset
++  # unmounted -- most visibly the user's /home, which then breaks key-based SSH
++  # and looks like a failed install. Prime the cache at install time and enable
++  # the services that keep it current. The root dataset is canmount=noauto and
++  # is mounted by the initramfs, so the generator skips it; zfs-mount.service is
++  # deliberately NOT enabled -- it would race the generator's units.
++  #
++  # The pool is imported under an altroot ($target) here, and both `zfs list`
++  # and `zfs get` report mountpoints prefixed with it (/mnt/home). Feeding that
++  # to the generator would create .mount units for /mnt/home, i.e. mount nothing
++  # useful. Generate the cache from the live environment and strip the altroot
++  # prefix so it holds the real paths (/home).
++  target="${target%/}"
++  mkdir -p "$target/etc/zfs/zfs-list.cache"
++  zfs list -H -t filesystem \
++    -o name,mountpoint,canmount,atime,relatime,devices,exec,readonly,setuid,nbmand,encroot,keylocation |
++    awk -v root="$target" 'BEGIN { FS = OFS = "\t" }
++      $2 == root { $2 = "/" }
++      index($2, root "/") == 1 { $2 = substr($2, length(root) + 1) }
++      { print }' >"$target/etc/zfs/zfs-list.cache/$ZFS_POOL"
++  arch-chroot "$target" systemctl enable zfs-zed.service zfs.target
++
++  _zfs_say "Building initramfs + ZFSBootMenu bundle"
++  arch-chroot "$target" bash -euo pipefail -c '
++    # The kernel lives at /usr/lib/modules/<ver>/vmlinuz. mkinitcpio -P run
++    # directly (not via the pacman hook) does NOT copy it into /boot, so the
++    # preset all_kver path would be unreadable. Copy it first.
++    for mod in /usr/lib/modules/*/; do
++      [ -f "${mod}vmlinuz" ] || continue
++      ver=${mod%/}; ver=${ver##*/}
++      pkgbase=$(cat "${mod}pkgbase" 2>/dev/null || echo "$ver")
++      cp -f "${mod}vmlinuz" "/boot/vmlinuz-${pkgbase}"
++    done
++    mkinitcpio -P
++    generate-zbm
++    efi=$(ls '"$esp_mount"'/EFI/zbm/*.EFI 2>/dev/null | head -1)
++    [ -n "$efi" ] || { echo "BLAD: generate-zbm nie utworzyl bundle EFI"; exit 1; }
++    mkdir -p '"$esp_mount"'/EFI/BOOT
++    cp -f "$efi" '"$esp_mount"'/EFI/BOOT/BOOTX64.EFI
++  '
++}
++
++# Write the ZFS flavour of the pre-mounted fstab (ESP only). Kept here so the
++# Python phase can delegate instead of duplicating shell.
++zfs_write_fstab() {
++  local target="$1" esp_dev="$2" esp_mount="$3" uuid
++  uuid=$(blkid -s UUID -o value "$esp_dev")
++  cat >"$target/etc/fstab" <<EOF
++# /etc/fstab — generated by Omarchy ISO (ZFS root)
++# <device>  <mount>  <fs>  <options>  <dump>  <pass>
++UUID=$uuid  $esp_mount  vfat  umask=0077,nofail,x-systemd.automount  0 0
++EOF
++}
+diff --git a/configs/profiledef.sh b/configs/profiledef.sh
+index d7d483c..64b9f7e 100644
+--- a/configs/profiledef.sh
++++ b/configs/profiledef.sh
+@@ -1,7 +1,7 @@
+ #!/usr/bin/env bash
+ # shellcheck disable=SC2034
+ 
+-iso_name="omarchy"
++iso_name="zfs-omarchy"
+ iso_label="OMARCHY_$(date --date="@${SOURCE_DATE_EPOCH:-$(date +%s)}" +%Y%m)"
+ iso_publisher="Omarchy <https://omarchy.org>"
+ iso_application="Omarchy Installer"
+diff --git a/plans/zfs-install.md b/plans/zfs-install.md
+new file mode 100644
+index 0000000..684898b
+--- /dev/null
++++ b/plans/zfs-install.md
+@@ -0,0 +1,224 @@
++# Plan: instalacja Omarchy na ZFS + ZFSBootMenu (dedykowany instalator)
++
++Status: **Prototyp 1 zweryfikowany** (boot chain działa). Poniżej ustalenia i
++plan integracji z `omarchy-iso`.
++
++## Cel
++
++Dedykowany instalator Omarchy:
++- cały dysk, **jeden natywnie zaszyfrowany pool ZFS** (`aes-256-gcm`,
++  `keyformat=passphrase`), `/boot` w środku roota,
++- **ZFSBootMenu** na ESP (fallback `EFI/BOOT/BOOTX64.EFI`), bez Limine,
++- **bez btrfs**, **bez hibernacji**, snapshoty **ZFS** + boot environments ZBM,
++- kernel docelowy `linux-omarchy` + `zfs-dkms`, Secure Boot wyłączony.
++
++## Ustalenia z Prototypu 1 (protokoły w `zfs-proto/`)
++
++1. **Hook `zfs` w mkinitcpio jest busybox/ash** — z hookiem `systemd` root z ZFS
++   się NIE montuje (systemd czeka na `/dev/gpt-auto-root`). Wymagane hooki:
++   `base udev autodetect microcode modconf kms keyboard keymap consolefont block zfs filesystems fsck`.
++2. **ZBM cmdline**: właściwość `org.zfsbootmenu:commandline` **zastępuje** domyślny
++   cmdline OS. Ustawiamy `zfs=bootfs rw`.
++3. **Klucz**: `keylocation=file:///etc/zfs/zroot.key`, `keyformat=passphrase`,
++   plik klucza w `FILES` initramfs (leży na zaszyfrowanym root). ZBM pyta **raz**
++   (bo pliku nie widzi), system docelowy już nie.
++4. **Pakiety ZFS są w AUR**: `zfs-utils`, `zfs-dkms`, `zfsbootmenu` +
++   `perl-boolean`. Budujemy je; klucz OpenZFS (`4F3B…8027`) importujemy z pliku
++   (nie z keyservera).
++5. **Nowy Arch nie daje presetów** w `/etc/mkinitcpio.d/` (generuje je pacman hook
++   z `/usr/share/mkinitcpio/hook.preset`). Tworzymy jawny preset per `pkgbase`.
++6. **ESP w fstab** z `nofail,x-systemd.automount` — inaczej system wpada w
++   emergency, gdy ESP nie wstanie.
++7. `zfs-dkms` buduje się pod `linux-omarchy` (na hoście: `7.2.5-3-omarchy`).
++8. Obraz budujemy jako root, ale QEMU odpalamy jako user → `chown` obrazu.
++
++## Problem: zależności pakietu `omarchy`
++
++`omarchy` (meta) zależy od `limine`, `limine-mkinitcpio-hook`,
++`limine-snapper-sync`, `snapper` (btrfs/Limine). W trybie ZFS trzeba je pominąć
++(`pacman -S --assume-installed …`) albo przygotować zmodyfikowany meta-pakiet,
++i NIE uruchamiać hooków Limine/Snapper.
++
++## Projekt integracji z `omarchy-iso`
++
++Tryb `omarchy_install.mode = "zfs"` w orchestratorze (Python).
++
++### `context.py`
++- `mode` rozpoznaje `"zfs"`; dodać `is_zfs`.
++- Współdzielić ścieżkę `pre_mounted_config` (`target_mount=/mnt`).
++
++### Nowe/s zmienione fazy (`phases_impl.py`)
++- **`prepare_zfs_pool`** (przed `arch_install_system`):
++  1. GPT: ESP (vfat, ~1G) + `zroot` (reszta).
++  2. `zpool create` z `encryption=aes-256-gcm keyformat=passphrase keylocation=…`.
++  3. Datasety: `ROOT/omarchy` (mountpoint=/, canmount=noauto), `home`,
++     `var/log`, `var/cache/pacman/pkg`; `bootfs`.
++  4. Montaż w `ctx.target`; klucz do `/etc/zfs/zroot.key`; `zfs set
++     org.zfsbootmenu:commandline="zfs=bootfs rw"`.
++  5. fstab tylko dla ESP (`nofail,x-systemd.automount`).
++- `arch_install_system`: bez zmian (używa `pre_mounted_config`), ale pominąć
++  `_configure_limine_boot`.
++- **`finalize_zfs_boot`** (zamiast `finalize_limine_boot`):
++  - HOOKS busybox + `zfs`, `FILES=/etc/zfs/zroot.key`, preset per pkgbase,
++    `mkinitcpio -P`;
++  - zainstalować ZBM (`generate-zbm`), bundle EFI + fallback na ESP;
++  - `zfs snapshot` zamiast fabrycznego snappera.
++- `configure_hibernation`: **no-op** w trybie zfs.
++- `create_factory_snapshot` → snapshot ZFS.
++
++### `main.py`
++- Warunkowy wybór faz: dla `mode == "zfs"` użyć `prepare_zfs_pool` /
++  `finalize_zfs_boot` i pominąć fazy Limine/hibernacji.
++
++### Configurator
++- Dodać opcję instalacji ZFS (albo dedykowany ISO = tylko ZFS).
++
++### Budowa ISO (`builder/build-iso.sh`)
++- Live env (kernel `linux-t2`, archiso): dodać `zfs-utils` + moduł ZFS dla
++  `linux-t2` (potrzebne `linux-t2-headers`; mact2 repo już jest w configach).
++- Offline mirror: dodać zbudowane AUR-owo `zfs-utils`, `zfs-dkms`,
++  `zfsbootmenu`, `perl-boolean` oraz `linux-omarchy-headers`.
++
++## Otwarte pytania
++
++- Live kernel: zostawić `linux-t2` (i budować zfs-dkms dla niego) czy przełączyć
++  live na `linux`/`linux-omarchy` z gotowym ZFS? (T2 Mac traci wsparcie live).
++- Czy dedykowany ISO tylko ZFS, czy tryb wybierany w instalatorze?
++- Dostarczenie ZFS jako AUR-build w `build-iso.sh` vs dołączenie repo `archzfs`.
++
++---
++
++# HANDOFF (stan na sesję 2)
++
++## Co DZIAŁA (zweryfikowane w QEMU, bezrebuildowo harnessem A)
++
++Instalacja ZFS **przechodzi wszystkie fazy do „Reboot”**:
++partycje → pool → pakiety Arch+Omarchy → konfiguracja → `finalize_zfs_boot`
++→ koniec. ZBM z zainstalowanego dysku startuje, odszyfrowuje `zroot` i **znajduje jądro**.
++
++## Root cause ostatniego blokera (sesja 3) — ROZWIĄZANY
++
++Objaw: OS nie montował roota (systemd wpadał w `gpt-auto-root`), bo docelowy
++initramfs nie zawierał hooka `zfs` ani `zfs.ko`. `mkinitcpio -P` „przechodził”,
++ale budował obraz ze **stockowym systemd-hookiem** (bez `zfs`), mimo że
++`/etc/mkinitcpio.conf.d/zz-omarchy-zfs.conf` miał poprawne HOOKS.
++
++Prawdziwa przyczyna: **generowany preset ustawiał `ALL_config="/etc/mkinitcpio.conf"`.**
++Przy `process_preset` mkinitcpio dokłada wtedy `-c /etc/mkinitcpio.conf`, a gdy
++config jest podany przez `-c`/preset, mkinitcpio ustawia `_optconfd=0` i **w ogóle
++nie czyta drop-inów** z `/etc/mkinitcpio.conf.d/`. Efekt: `zz-omarchy-zfs.conf`
++(dodający `zfs` do HOOKS i `FILES=/etc/zfs/zroot.key`) był ignorowany.
++
++Komunikat `'/lib/modules/7.2.5-3-omarchy' is not a valid kernel module directory`
++okazał się efemeryczny — nie reprodukuje się (katalog istnieje, ma `modules.dep`,
++`/lib → usr/lib`). Realnym problemem było zbudowanie initramfs **bez ZFS**, nie sam
++katalog modułów.
++
++Fix: zakomentować `ALL_config` w generowanym presecie, dokładnie jak w
++`/usr/share/mkinitcpio/hook.preset`. Wtedy mkinitcpio bierze domyślny config i
++wczytuje drop-iny. Zweryfikowane: `mkinitcpio -P` raportuje „Using drop-in
++configuration file: 'zz-omarchy-zfs.conf'” i buduje `[udev] … [zfs]`; `lsinitcpio`
++pokazuje `hooks/zfs`, `zfs.ko.zst` oraz `etc/zfs/zroot.key`.
++
++## Drugi problem (znaleziony przy weryfikacji bootu) — ROZWIĄZANY
++
++Po naprawie initramfs OS **wystartował** (`findmnt /` → `zroot/ROOT/omarchy`, sshd
++wstał), ale pozostałe datasety (`home`, `var/log`, `var/cache/pacman`) się **nie
++montowały** — brak `/home/omarchy`, więc i key-based SSH nie działał. Przyczyna:
++brak `/etc/zfs/zfs-list.cache/<pool>` i wyłączone `zfs-zed`/`zfs.target`, więc
++`zfs-mount-generator` nie miał z czego wygenerować jednostek `.mount`.
++
++Fix: w `zfs_finalize_boot` wygenerować cache (`zfs list -H -t filesystem -o
++name,mountpoint,… > /etc/zfs/zfs-list.cache/<pool>`) i `systemctl enable
++zfs-zed.service zfs.target`. Uwaga: **NIE** włączać `zfs-mount.service`
++(`zfs mount -a`) — ścigałby się z jednostkami generatora o te same datasety.
++Zweryfikowane cold-bootem: wszystkie datasety zamontowane, `/home/omarchy` jest,
++`systemctl --failed` puste.
++
++## Trzeci problem: panic przy pierwszym boocie — ROZWIĄZANY
++
++Objaw: po instalacji OS panikuje (`Kernel panic - not syncing: Attempted to
++kill init! exitcode=0x00000100`, `Comm: init`, ~0.3 s po załadowaniu modułu ZFS,
++zanim cokolwiek zamontuje root). Zdekodowane z QR paniki (`panic.archlinux.org`,
++format FIDO2: 17 cyfr → 7 bajtów little-endian, potem zlib) potwierdza, że to
++initramfs docelowy wychodzi.
++
++Realny log z initramfs (direct boot z `console=ttyS0`):
++
++```
++:: running hook [zfs]
++cannot import 'zroot': pool was previously in use from another system.
++Last accessed by archiso (hostid=0) at ...
++The pool can be imported, use 'zpool import -f' to import the pool.
++-> Kernel panic: Attempted to kill init!
++```
++
++Przyczyna: instalator **nie eksportuje** puli na koniec — zostaje zaimportowana
++przez live-env (później przez ZBM). Initramfs docelowy robi `zpool import` bez
++`-f`, dostaje „pool was previously in use", hook `zfs` przerywa, PID 1 (`init`)
++wychodzi → panic. (Wcześniejsze „udane" booty przechodziły tylko dlatego, że
++przed rebootem ręcznie robiłem `zpool export`.)
++
++Fix: `org.zfsbootmenu:commandline="zfs=bootfs rw zfs_force=1"` — hook `zfs`
++używa wtedy `zpool import -f`. Zweryfikowane direct-bootem: OS dochodzi do
++`Reached target ZFS startup target` i `login:`.
++
++### Stan: ROZWIĄZANE end-to-end (sesja 3)
++
++Oba fixy w `zfs.sh` + poprawka altroota. Pełny instalator od zera
++(`INSTALL_RC=0`), potem cold boot: ZBM → odszyfrowanie → OS startuje,
++`findmnt /` → `zroot/ROOT/omarchy`, **wszystkie** datasety zamontowane
++(`home`, `var/log`, `var/cache/pacman`), key-based SSH działa,
++`systemctl --failed` puste.
++
++Uwaga (trzeci problem, złapany przy weryfikacji): pool jest importowany w
++instalatorze z `altroot=$target` (`/mnt`), a **zarówno `zfs list`, jak i
++`zfs get`** raportują wtedy `mountpoint` z prefiksem altroota (`/mnt/home`).
++Cache generowany w chrootcie zawierał więc złe ścieżki, a generator tworzył
++jednostki `.mount` dla `/mnt/home`. Fix: generować cache w live-env i zdjąć
++prefiks altroota (`awk`), zostawiając `/home`, `/var/log`, `/` — jak wyżej.
++
++Zostaje: rebuild ISO ze stałym `zfs.sh` (commit zrobiony).
++
++### Jak to zweryfikowano (harness: 9p + QMP, bez rebuildu ISO)
++
++- `inspect-boot.sh` — boot live ISO z GTK, **nie kasuje** dysku, podpina repo i
++  workdir przez 9p (`mount_tag=repo`/`work`), QMP do sterowania.
++- `vmctl.py` — QMP: `type`/`exec`/`key` (sendkey) + `snap`/`ocr` (screendump).
++- `diag.sh`, `diag2.sh`, `testfix.sh`, `refix.sh` — diagnoza HOOKS/presetu.
++- `boot-installed.sh` — boot **zainstalowanego** systemu (bez ISO) z ESP.
++- `qssh.sh` — komendy na uruchomionym OS (hasło `omarchy`).
++
++## Pełna lista problemów znalezionych i naprawionych (komendy)
++
++| # | Problem | Fix (plik) |
++|---|---|---|
++| 1 | archinstall zna tylko Systemd-boot/Grub/Efistub/Limine | JSON `Limine` + `if ctx.is_zfs: return` w `_configure_limine_boot` |
++| 2 | `sgdisk --zap-all` kasuje tablicę | `parted mklabel gpt` przed `mkpart` (zfs.sh) |
++| 3 | partycja ZFS startuje na ostatnim sektorze ESP | +1 MiB przerwy (zfs.sh) |
++| 4 | ESP bez systemu plików | `mkfs.vfat -F32` (zfs.sh) |
++| 5 | dataset `var/cache/pacman` bez rodzica | `zfs create -p` (zfs.sh) |
++| 6 | `zfs create/mount` nie przerywały przy błędzie | `disk_step` (zfs.sh) |
++| 7 | hasło ZFS < 8 znaków | walidacja w `zfs_prepare_target` |
++| 8 | `partition_path` dla `loop` | dodaj `*loop*` (disk-partitioning.sh) |
++| 9 | `snapper.sh` (btrfs) wywala „Configuring system” | neutralizacja w `run_system_finalizer` |
++| 10 | `limine-mkinitcpio-hook` buduje UKI, brak `vmlinuz` | `pacman -Rdd limine limine-mkinitcpio-hook limine-snapper-sync snapper` + `/etc/boot/hooks` |
++| 11 | `mkinitcpio -P` nie kopiuje jądra do /boot | własna kopia `cp /usr/lib/modules/<ver>/vmlinuz /boot/vmlinuz-<pkgbase>` |
++| 12 | ESP w `/boot` → ZBM nie widzi jądra | ESP na `/efi`, `/boot` na ZFS |
++| 13 | `omarchy_hooks.conf` nadpisuje HOOKS | neutralizacja + `zz-omarchy-zfs.conf` |
++| **14** | **initramfs bez `zfs`**: preset `ALL_config` → `-c` → mkinitcpio pomija drop-iny z `conf.d` | zakomentuj `ALL_config` w generowanym presecie (zfs.sh) |
++| 15 | datasety ZFS (`home`, `var/log`, pkg cache) nie montują się przy boot | prime `/etc/zfs/zfs-list.cache/<pool>` + `systemctl enable zfs-zed zfs.target` (zfs.sh) |
++| 16 | cache mountpointów z prefiksem altroota (`/mnt/home`) → generator robi złe jednostki `.mount` | generuj cache w live-env i zdejmij prefiks altroota (awk) (zfs.sh) |
++| 17 | panic „Attempted to kill init" — pool zostaje „in use", initramfs `zpool import` bez `-f` przerywa | `zfs_force=1` w `org.zfsbootmenu:commandline` (zfs.sh) |
++
++## Harnessy (bezrebuildowa iteracja)
++
++W `~/work/zfs-proto` (uwaga: też w `/nvme5ex/DEMO/work/zfs-proto`):
++
++- `zfstest.sh` — Harness B: test `zfs_prepare_target` na loop-image na hoście (~30 s).
++- `devshare.sh` — buduje FAT `DEVCODE` (kod + seed cidata).
++- `devloop-boot.sh` — boot ISO z DEVCODE (UWAGA: kasuje `iso-test-disk.qcow2`!).
++- `guest-dev.sh` — w gościu: kopiuje kod z DEVCODE do live-env, seeduje /root, re-run instalatora.
++- `inspect.sh` — montuje zainstalowany pool i dumpuje HOOKS/initramfs/cmdline.
++
++Branch `zfs-install` w `omarchy-iso` z commitami wszystkich fixów.
