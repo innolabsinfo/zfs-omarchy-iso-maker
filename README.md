@@ -1,4 +1,4 @@
-# zfs-mode — drop the ZFS install mode onto a fresh omarchy-iso checkout
+# Omarchy on ZFS with ZFSBootMenu - create new ISO
 
 Everything the `zfs-install` branch adds, packaged so it can be replayed onto a
 clean upstream clone.
