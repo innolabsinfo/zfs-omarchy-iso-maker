@@ -5,6 +5,12 @@ clean upstream clone.
 
 ![Omarchy with ZFS](./screens/01-zfs.png)
 
+## Dedicated Omarchy installer:                                                           
+- whole disk, **a single natively-encrypted ZFS pool** (`aes-256-gcm`,`keyformat=passphrase`), `/boot` inside the root,                                         
+- **ZFSBootMenu** on the ESP (fallback `EFI/BOOT/BOOTX64.EFI`), no Limine,                  
+- **no btrfs**, **no hibernation**, **ZFS** snapshots + ZBM boot environments,              
+- target kernel `linux-omarchy` + `zfs-dkms`, Secure Boot disabled.
+    
 ## Contents
 
 - `apply-zfs.sh` — self-contained script; the patch is embedded, so this single
